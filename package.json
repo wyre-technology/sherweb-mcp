@@ -1,5 +1,5 @@
 {
-  "name": "@wyre-technology/mcp-server-sherweb",
+  "name": "@wyre-technology/sherweb-mcp",
   "version": "0.0.0-semantically-released",
   "description": "MCP server for Sherweb Partner API - distributor billing, service provider management, customer subscriptions, and payable charges",
   "type": "module",
@@ -22,7 +22,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wyre-technology/mcp-server-sherweb.git"
+    "url": "git+https://github.com/wyre-technology/sherweb-mcp.git"
   },
   "keywords": [
     "mcp",
@@ -36,9 +36,9 @@
   "author": "Wyre Technology",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/wyre-technology/mcp-server-sherweb/issues"
+    "url": "https://github.com/wyre-technology/sherweb-mcp/issues"
   },
-  "homepage": "https://github.com/wyre-technology/mcp-server-sherweb#readme",
+  "homepage": "https://github.com/wyre-technology/sherweb-mcp#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3"
   },
