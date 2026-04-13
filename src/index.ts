@@ -44,7 +44,7 @@ import {
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { getDomainHandler, getAvailableDomains } from "./domains/index.js";
 import { isDomainName, type DomainName } from "./utils/types.js";
-import { getCredentials, resetClient } from "./utils/client.js";
+import { getCredentials, runWithCredentials } from "./utils/client.js";
 import { logger } from "./utils/logger.js";
 import { setServerRef } from "./utils/server-ref.js";
 import {
@@ -596,11 +596,13 @@ async function startHttpTransport(): Promise<void> {
             return;
           }
 
-          // Reset client so next request picks up the new credentials
-          resetClient();
-          process.env.SHERWEB_CLIENT_ID = clientId;
-          process.env.SHERWEB_CLIENT_SECRET = clientSecret;
-          process.env.SHERWEB_SUBSCRIPTION_KEY = subscriptionKey;
+          // Pass credentials via AsyncLocalStorage so concurrent requests
+          // cannot leak credentials across tenants.
+          runWithCredentials(
+            { clientId, clientSecret, subscriptionKey },
+            () => transport.handleRequest(req, res),
+          );
+          return;
         }
 
         transport.handleRequest(req, res);

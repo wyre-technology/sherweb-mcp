@@ -16,6 +16,7 @@
  * - Service Provider API: https://api.sherweb.com/service-provider/v1
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "./logger.js";
 import {
   SHERWEB_AUTH_URL,
@@ -31,9 +32,30 @@ let accessToken: string | null = null;
 let tokenExpiry: number = 0;
 
 /**
- * Get credentials from environment variables
+ * Per-request credential store for gateway mode.
+ * Ensures concurrent requests cannot leak credentials across tenants.
+ */
+const credentialStore = new AsyncLocalStorage<SherwebCredentials>();
+
+/**
+ * Run a callback with per-request credential overrides.
+ * Used by the HTTP transport in gateway mode.
+ */
+export function runWithCredentials<T>(creds: SherwebCredentials, fn: () => T): T {
+  return credentialStore.run(creds, fn);
+}
+
+/**
+ * Get credentials — checks per-request store first, then falls back to env vars.
  */
 export function getCredentials(): SherwebCredentials | null {
+  // Per-request override (gateway mode)
+  const override = credentialStore.getStore();
+  if (override) {
+    return override;
+  }
+
+  // Fallback to environment variables (stdio / env mode)
   const clientId = process.env.SHERWEB_CLIENT_ID;
   const clientSecret = process.env.SHERWEB_CLIENT_SECRET;
   const subscriptionKey = process.env.SHERWEB_SUBSCRIPTION_KEY;
