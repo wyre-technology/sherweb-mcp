@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * Sherweb MCP Server with Decision Tree Architecture
+ * Sherweb MCP Server
  *
- * This MCP server uses a hierarchical tool loading approach:
- * 1. Initially exposes only a navigation tool
- * 2. After user selects a domain, exposes domain-specific tools
- * 3. Lazy-loads domain handlers on first access
+ * This MCP server provides tools for interacting with the Sherweb Partner API.
+ * All tools are listed upfront so they work with every MCP client, including
+ * remote connectors (claude.ai, mcp-remote) that do not support dynamic
+ * tool-list changes. A helper `sherweb_navigate` tool provides domain
+ * discovery and guidance.
  *
  * Supports both stdio and HTTP transports:
  * - stdio (default): For local Claude Desktop / CLI usage
@@ -16,10 +17,6 @@
  *   and SHERWEB_SUBSCRIPTION_KEY environment variables
  * - gateway: Credentials injected from request headers by the MCP gateway
  *   - Headers: X-Sherweb-Client-ID, X-Sherweb-Client-Secret, X-Sherweb-Subscription-Key
- *
- * Lazy loading mode (LAZY_LOADING=true):
- * - Exposes meta-tools: sherweb_list_categories, sherweb_list_category_tools,
- *   sherweb_execute_tool, sherweb_router
  *
  * Domains:
  * - billing: Payable charges, billing periods, charge details, pricing
@@ -53,8 +50,15 @@ import {
   routeIntent,
 } from "./utils/categories.js";
 
-// Server navigation state
-let currentDomain: DomainName | null = null;
+/**
+ * Domain metadata for navigation
+ */
+const domainDescriptions: Record<DomainName, string> = {
+  billing: "Payable charges, billing periods, charge details, pricing",
+  customers: "List customers, customer details, accounts receivable",
+  subscriptions: "Subscription management, quantity changes",
+  catalog: "Product catalog browsing (future capability)",
+};
 
 // Create the MCP server
 const server = new Server(
@@ -72,46 +76,41 @@ const server = new Server(
 setServerRef(server);
 
 /**
- * Navigation tool - shown when at root (no domain selected)
+ * Navigation / discovery tool - helps the LLM find the right tools
+ *
+ * This is a stateless helper that describes available tools for a domain.
+ * All domain tools are always listed in tools/list regardless of navigation
+ * state, because many MCP clients (claude.ai connectors, mcp-remote) only
+ * fetch the tool list once and do not support notifications/tools/list_changed.
  */
 const navigateTool: Tool = {
   name: "sherweb_navigate",
   description:
-    "Navigate to a Sherweb domain to access its tools. Available domains: billing (payable charges, billing periods, charge details), customers (customer list, details, accounts receivable), subscriptions (subscription management, quantity changes), catalog (product catalog browsing).",
+    "Discover available Sherweb tools by domain. Returns tool names and descriptions for the selected domain. All tools are callable at any time — this is a help/discovery aid, not a prerequisite.",
   inputSchema: {
     type: "object",
     properties: {
       domain: {
         type: "string",
         enum: getAvailableDomains(),
-        description:
-          "The domain to navigate to. Choose: billing, customers, subscriptions, or catalog",
+        description: `The domain to explore:
+- billing: ${domainDescriptions.billing}
+- customers: ${domainDescriptions.customers}
+- subscriptions: ${domainDescriptions.subscriptions}
+- catalog: ${domainDescriptions.catalog}`,
       },
     },
     required: ["domain"],
   },
 };
 
-/**
- * Back navigation tool - shown when inside a domain
- */
-const backTool: Tool = {
-  name: "sherweb_back",
-  description:
-    "Navigate back to the main menu to select a different domain",
-  inputSchema: {
-    type: "object",
-    properties: {},
-  },
-};
 
 /**
- * Status tool - always available
+ * Status tool - shows credentials status and available domains
  */
 const statusTool: Tool = {
   name: "sherweb_status",
-  description:
-    "Show current navigation state and available domains. Also verifies API credentials are configured.",
+  description: "Show credentials status and available domains",
   inputSchema: {
     type: "object",
     properties: {},
@@ -189,37 +188,54 @@ const metaTools: Tool[] = [
 ];
 
 /**
+ * Map from domain name to its tool definitions (loaded lazily)
+ */
+const domainToolMap = new Map<DomainName, Tool[]>();
+
+/**
+ * All domain tools, collected once at startup
+ */
+let allDomainTools: Tool[] | null = null;
+
+/**
+ * Load all domain tools (lazy-loaded on first access)
+ */
+async function getAllDomainTools(): Promise<Tool[]> {
+  if (allDomainTools !== null) {
+    return allDomainTools;
+  }
+
+  const domains = getAvailableDomains();
+  const tools: Tool[] = [];
+
+  for (const domain of domains) {
+    if (!domainToolMap.has(domain)) {
+      const handler = await getDomainHandler(domain);
+      const domainTools = handler.getTools();
+      domainToolMap.set(domain, domainTools);
+    }
+    tools.push(...domainToolMap.get(domain)!);
+  }
+
+  allDomainTools = tools;
+  return tools;
+}
+
+/**
  * Check whether lazy-loading mode is enabled via environment variable.
  */
 function isLazyLoadingEnabled(): boolean {
   return process.env.LAZY_LOADING === "true";
 }
 
-/**
- * Get tools based on current navigation state
- */
-async function getToolsForState(): Promise<Tool[]> {
-  const tools: Tool[] = [statusTool];
-
-  if (currentDomain === null) {
-    tools.unshift(navigateTool);
-  } else {
-    tools.unshift(backTool);
-    const handler = await getDomainHandler(currentDomain);
-    const domainTools = handler.getTools();
-    tools.push(...domainTools);
-  }
-
-  return tools;
-}
 
 // Handle ListTools requests
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (isLazyLoadingEnabled()) {
     return { tools: metaTools };
   }
-  const tools = await getToolsForState();
-  return { tools };
+  const domainTools = await getAllDomainTools();
+  return { tools: [navigateTool, statusTool, ...domainTools] };
 });
 
 // Handle CallTool requests
@@ -386,73 +402,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Navigate to a domain
+    // Handle navigation / discovery helper
     if (name === "sherweb_navigate") {
-      const domain = (args as { domain: string }).domain;
+      const { domain } = args as { domain: DomainName };
 
       if (!isDomainName(domain)) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid domain: '${domain}'. Available domains: ${getAvailableDomains().join(", ")}`,
+              text: `Invalid domain: ${domain}. Available domains: ${getAvailableDomains().join(", ")}`,
             },
           ],
           isError: true,
         };
       }
 
-      // Validate credentials before allowing navigation
-      const creds = getCredentials();
-      if (!creds) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: No API credentials configured. Please set SHERWEB_CLIENT_ID, SHERWEB_CLIENT_SECRET, and SHERWEB_SUBSCRIPTION_KEY environment variables.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      currentDomain = domain;
       const handler = await getDomainHandler(domain);
-      const domainTools = handler.getTools();
+      const tools = handler.getTools();
 
-      logger.info("Navigated to domain", {
-        domain,
-        toolCount: domainTools.length,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Navigated to ${domain} domain.\n\nAvailable tools:\n${domainTools
-              .map((t) => `- ${t.name}: ${t.description}`)
-              .join("\n")}\n\nUse sherweb_back to return to the main menu.`,
-          },
-        ],
-      };
-    }
-
-    // Navigate back to root
-    if (name === "sherweb_back") {
-      const previousDomain = currentDomain;
-      currentDomain = null;
+      const toolSummary = tools
+        .map((t) => `- ${t.name}: ${t.description}`)
+        .join("\n");
 
       return {
         content: [
           {
             type: "text",
-            text: `Navigated back from ${previousDomain || "root"} to the main menu.\n\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nUse sherweb_navigate to select a domain.`,
+            text: `${domainDescriptions[domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
           },
         ],
       };
     }
 
-    // Status check
+
     if (name === "sherweb_status") {
       const creds = getCredentials();
       const credStatus = creds
@@ -463,39 +446,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Sherweb MCP Server Status\n\nCurrent domain: ${currentDomain || "(none - at main menu)"}\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}`,
+            text: `Sherweb MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nAll tools are available at all times. Use sherweb_navigate to discover tools by domain.`,
           },
         ],
       };
     }
 
-    // Domain-specific tool calls
-    if (currentDomain !== null) {
-      const handler = await getDomainHandler(currentDomain);
-      const domainTools = handler.getTools();
-      const toolExists = domainTools.some((t) => t.name === name);
+    // Route to appropriate domain handler
+    const toolArgs = (args ?? {}) as Record<string, unknown>;
 
-      if (toolExists) {
-        const result = await handler.handleCall(
-          name,
-          args as Record<string, unknown>
-        );
-        logger.debug("Tool call completed", {
-          tool: name,
-          responseSize: JSON.stringify(result).length,
-        });
-        return result;
-      }
+    if (name.startsWith("sherweb_billing_")) {
+      const handler = await getDomainHandler("billing");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("sherweb_customers_")) {
+      const handler = await getDomainHandler("customers");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("sherweb_subscriptions_")) {
+      const handler = await getDomainHandler("subscriptions");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("sherweb_catalog_")) {
+      const handler = await getDomainHandler("catalog");
+      return await handler.handleCall(name, toolArgs);
     }
 
-    // Tool not found
+    // Unknown tool
     return {
       content: [
         {
           type: "text",
-          text: currentDomain
-            ? `Unknown tool: '${name}'. You are in the '${currentDomain}' domain. Use sherweb_back to return to the main menu.`
-            : `Unknown tool: '${name}'. Use sherweb_navigate to select a domain first.`,
+          text: `Unknown tool: ${name}. Use sherweb_navigate to discover available tools by domain.`,
         },
       ],
       isError: true,
