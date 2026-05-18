@@ -49,6 +49,7 @@ import {
   findDomainForTool,
   routeIntent,
 } from "./utils/categories.js";
+import { HEALTH_RESPONSE, isHealthPath } from "./health.js";
 
 /**
  * Domain metadata for navigation
@@ -525,25 +526,13 @@ async function startHttpTransport(): Promise<void> {
         `http://${req.headers.host || "localhost"}`
       );
 
-      // Health check - no auth required
-      if (url.pathname === "/health") {
-        const creds = getCredentials();
-        const statusCode = creds ? 200 : 503;
-
-        res.writeHead(statusCode, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            status: creds ? "ok" : "degraded",
-            transport: "http",
-            authMode: isGatewayMode ? "gateway" : "env",
-            timestamp: new Date().toISOString(),
-            credentials: {
-              configured: !!creds,
-            },
-            logLevel: process.env.LOG_LEVEL || "info",
-            version: "1.0.0",
-          })
-        );
+      // Health check - shallow liveness probe, no auth, no credential check.
+      // In gateway mode credentials arrive per-request via headers, so this
+      // route must never depend on process-wide credentials or it will 503
+      // and cause Azure's liveness probe to SIGTERM-kill the container.
+      if (isHealthPath(url.pathname)) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(HEALTH_RESPONSE));
         return;
       }
 
@@ -596,7 +585,7 @@ async function startHttpTransport(): Promise<void> {
       res.end(
         JSON.stringify({
           error: "Not found",
-          endpoints: ["/mcp", "/health"],
+          endpoints: ["/mcp", "/health", "/healthz"],
         })
       );
     }
