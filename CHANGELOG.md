@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `GET /health` (and new `GET /healthz`) are now shallow, unauthenticated
+  liveness probes that always return `200 {"status":"ok"}`. Previously
+  `/health` called `getCredentials()` and returned `503` when no
+  process-wide credentials were set, which is always the case in gateway
+  mode (`AUTH_MODE=gateway`) where credentials arrive per-request via
+  headers. This caused the Azure Container Apps liveness probe to fail and
+  SIGTERM-kill the container in a crash loop.
+
 ## [0.1.0] - 2026-03-10
 
 ### Added
