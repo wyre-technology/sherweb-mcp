@@ -49,6 +49,7 @@ import {
   findDomainForTool,
   routeIntent,
 } from "./utils/categories.js";
+import { HEALTH_RESPONSE, isHealthPath } from "./health.js";
 
 /**
  * Domain metadata for navigation
@@ -529,9 +530,9 @@ async function startHttpTransport(): Promise<void> {
       // In gateway mode credentials arrive per-request via headers, so this
       // route must never depend on process-wide credentials or it will 503
       // and cause Azure's liveness probe to SIGTERM-kill the container.
-      if (url.pathname === "/health" || url.pathname === "/healthz") {
+      if (isHealthPath(url.pathname)) {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
+        res.end(JSON.stringify(HEALTH_RESPONSE));
         return;
       }
 
