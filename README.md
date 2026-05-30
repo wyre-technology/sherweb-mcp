@@ -2,6 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
+[![SafeSkill 96/100](https://img.shields.io/badge/SafeSkill-96%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/wyre-technology-sherweb-mcp)
 
 A Model Context Protocol (MCP) server for Sherweb cloud marketplace and partner portal. Enables AI assistants to manage customer subscriptions, browse the product catalog, and handle billing operations.
 
