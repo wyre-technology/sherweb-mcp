@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Multi-client Streamable HTTP: build a fresh `Server` + fresh
+  `StreamableHTTPServerTransport` per `/mcp` request (stateless —
+  `sessionIdGenerator: undefined`) instead of sharing one stateful transport
+  for the process lifetime. The shared, stateful transport
+  (`sessionIdGenerator: () => randomUUID()`) rejected every client after the
+  first with `-32600 "Invalid Request: Server already initialized"`, so behind
+  the multi-user gateway only the first user since container start received
+  tools — everyone else silently got zero tools until a restart. Request
+  handlers were extracted into a `setupHandlers(server)` / `createFreshServer()`
+  factory so both stdio and per-request HTTP servers share one definition. Each
+  per-request server + transport is disposed on `res` close. stdio mode keeps a
+  single long-lived server (it is inherently single-client). The gateway
+  credential-header check and per-request `runWithCredentials`
+  (AsyncLocalStorage) isolation are preserved. The per-request handler is fully
+  guarded: on error it responds
+  `500 {"jsonrpc":"2.0","error":{"code":-32603,...},"id":null}` when the
+  response has not started and never rethrows, so one bad request cannot crash
+  the container via a global `unhandledRejection` handler.
 - `GET /health` (and new `GET /healthz`) are now shallow, unauthenticated
   liveness probes that always return `200 {"status":"ok"}`. Previously
   `/health` called `getCredentials()` and returned `503` when no
