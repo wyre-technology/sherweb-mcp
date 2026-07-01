@@ -30,7 +30,6 @@ import {
   IncomingMessage,
   ServerResponse,
 } from "node:http";
-import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -61,20 +60,39 @@ const domainDescriptions: Record<DomainName, string> = {
   catalog: "Product catalog browsing (future capability)",
 };
 
-// Create the MCP server
-const server = new Server(
-  {
-    name: "mcp-server-sherweb",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
+/**
+ * Create a fresh MCP Server instance with all request handlers registered.
+ *
+ * A brand-new Server (paired with a brand-new transport) is built for every
+ * HTTP request. The Streamable HTTP transport is stateless, so a single
+ * shared, stateful transport rejects every client after the first with
+ * "Invalid Request: Server already initialized" (-32600). Behind the
+ * multi-user gateway that meant only the first user since container start ever
+ * received tools — everyone else silently got zero tools until a restart.
+ *
+ * stdio mode is inherently single-client and keeps one long-lived server;
+ * only HTTP mode needs a fresh server per request.
+ */
+function createFreshServer(): Server {
+  const server = new Server(
+    {
+      name: "mcp-server-sherweb",
+      version: "1.0.0",
     },
-  }
-);
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
 
-setServerRef(server);
+  server.onerror = (error: Error) => {
+    logger.error("MCP server error", { error: error.message });
+  };
+
+  setupHandlers(server);
+  return server;
+}
 
 /**
  * Navigation / discovery tool - helps the LLM find the right tools
@@ -230,144 +248,78 @@ function isLazyLoadingEnabled(): boolean {
 }
 
 
-// Handle ListTools requests
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  if (isLazyLoadingEnabled()) {
-    return { tools: metaTools };
-  }
-  const domainTools = await getAllDomainTools();
-  return { tools: [navigateTool, statusTool, ...domainTools] };
-});
-
-// Handle CallTool requests
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  logger.info("Tool call received", { tool: name, arguments: args });
-
-  try {
-    // -----------------------------------------------------------------
-    // Lazy-loading meta-tool handlers
-    // -----------------------------------------------------------------
-
-    if (name === "sherweb_list_categories") {
-      const categories = Object.entries(TOOL_CATEGORIES).map(
-        ([categoryName, cat]) => ({
-          name: categoryName,
-          description: cat.description,
-          toolCount: cat.tools.length,
-        })
-      );
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ categories }, null, 2),
-          },
-        ],
-      };
+/**
+ * Register every MCP request handler on a server instance. Invoked once for
+ * the long-lived stdio server and once per fresh per-request HTTP server.
+ */
+function setupHandlers(server: Server): void {
+  // Handle ListTools requests
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    if (isLazyLoadingEnabled()) {
+      return { tools: metaTools };
     }
+    const domainTools = await getAllDomainTools();
+    return { tools: [navigateTool, statusTool, ...domainTools] };
+  });
 
-    if (name === "sherweb_list_category_tools") {
-      const category = (args as { category: string }).category;
-      if (!isDomainName(category)) {
+  // Handle CallTool requests
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    logger.info("Tool call received", { tool: name, arguments: args });
+
+    try {
+      // -----------------------------------------------------------------
+      // Lazy-loading meta-tool handlers
+      // -----------------------------------------------------------------
+
+      if (name === "sherweb_list_categories") {
+        const categories = Object.entries(TOOL_CATEGORIES).map(
+          ([categoryName, cat]) => ({
+            name: categoryName,
+            description: cat.description,
+            toolCount: cat.tools.length,
+          })
+        );
         return {
           content: [
             {
               type: "text",
-              text: `Invalid category: '${category}'. Available categories: ${Object.keys(TOOL_CATEGORIES).join(", ")}`,
+              text: JSON.stringify({ categories }, null, 2),
             },
           ],
-          isError: true,
         };
       }
 
-      const handler = await getDomainHandler(category);
-      const tools = handler.getTools();
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
+      if (name === "sherweb_list_category_tools") {
+        const category = (args as { category: string }).category;
+        if (!isDomainName(category)) {
+          return {
+            content: [
               {
-                category,
-                description: TOOL_CATEGORIES[category].description,
-                tools: tools.map((t) => ({
-                  name: t.name,
-                  description: t.description,
-                  inputSchema: t.inputSchema,
-                })),
+                type: "text",
+                text: `Invalid category: '${category}'. Available categories: ${Object.keys(TOOL_CATEGORIES).join(", ")}`,
               },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
+            ],
+            isError: true,
+          };
+        }
 
-    if (name === "sherweb_execute_tool") {
-      const toolName = (
-        args as { toolName: string; arguments?: Record<string, unknown> }
-      ).toolName;
-      const toolArgs = (
-        args as { toolName: string; arguments?: Record<string, unknown> }
-      ).arguments ?? {};
+        const handler = await getDomainHandler(category);
+        const tools = handler.getTools();
 
-      // Validate credentials
-      const creds = getCredentials();
-      if (!creds) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: No API credentials configured. Please set SHERWEB_CLIENT_ID, SHERWEB_CLIENT_SECRET, and SHERWEB_SUBSCRIPTION_KEY environment variables.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const domain = findDomainForTool(toolName);
-      if (!domain) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Unknown tool: '${toolName}'. Use sherweb_list_categories and sherweb_list_category_tools to discover available tools.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const handler = await getDomainHandler(domain);
-      const result = await handler.handleCall(toolName, toolArgs);
-
-      logger.debug("Meta-tool execute completed", {
-        tool: toolName,
-        domain,
-        responseSize: JSON.stringify(result).length,
-      });
-
-      return result;
-    }
-
-    if (name === "sherweb_router") {
-      const intent = (args as { intent: string }).intent;
-      const suggestions = routeIntent(intent);
-
-      if (suggestions.length === 0) {
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
-                  intent,
-                  suggestions: [],
-                  message:
-                    "No matching tools found for that intent. Use sherweb_list_categories to browse all available categories.",
+                  category,
+                  description: TOOL_CATEGORIES[category].description,
+                  tools: tools.map((t) => ({
+                    name: t.name,
+                    description: t.description,
+                    inputSchema: t.inputSchema,
+                  })),
                 },
                 null,
                 2
@@ -377,131 +329,250 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      // Enrich suggestions with their category
-      const enriched = suggestions.map((toolName) => {
+      if (name === "sherweb_execute_tool") {
+        const toolName = (
+          args as { toolName: string; arguments?: Record<string, unknown> }
+        ).toolName;
+        const toolArgs = (
+          args as { toolName: string; arguments?: Record<string, unknown> }
+        ).arguments ?? {};
+
+        // Validate credentials
+        const creds = getCredentials();
+        if (!creds) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: No API credentials configured. Please set SHERWEB_CLIENT_ID, SHERWEB_CLIENT_SECRET, and SHERWEB_SUBSCRIPTION_KEY environment variables.",
+              },
+            ],
+            isError: true,
+          };
+        }
+
         const domain = findDomainForTool(toolName);
-        return {
+        if (!domain) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Unknown tool: '${toolName}'. Use sherweb_list_categories and sherweb_list_category_tools to discover available tools.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const handler = await getDomainHandler(domain);
+        const result = await handler.handleCall(toolName, toolArgs);
+
+        logger.debug("Meta-tool execute completed", {
           tool: toolName,
-          category: domain,
-          categoryDescription: domain
-            ? TOOL_CATEGORIES[domain].description
-            : null,
-        };
-      });
+          domain,
+          responseSize: JSON.stringify(result).length,
+        });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { intent, suggestions: enriched },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
+        return result;
+      }
 
-    // Handle navigation / discovery helper
-    if (name === "sherweb_navigate") {
-      const { domain } = args as { domain: DomainName };
+      if (name === "sherweb_router") {
+        const intent = (args as { intent: string }).intent;
+        const suggestions = routeIntent(intent);
 
-      if (!isDomainName(domain)) {
+        if (suggestions.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    intent,
+                    suggestions: [],
+                    message:
+                      "No matching tools found for that intent. Use sherweb_list_categories to browse all available categories.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Enrich suggestions with their category
+        const enriched = suggestions.map((toolName) => {
+          const domain = findDomainForTool(toolName);
+          return {
+            tool: toolName,
+            category: domain,
+            categoryDescription: domain
+              ? TOOL_CATEGORIES[domain].description
+              : null,
+          };
+        });
+
         return {
           content: [
             {
               type: "text",
-              text: `Invalid domain: ${domain}. Available domains: ${getAvailableDomains().join(", ")}`,
+              text: JSON.stringify(
+                { intent, suggestions: enriched },
+                null,
+                2
+              ),
             },
           ],
-          isError: true,
         };
       }
 
-      const handler = await getDomainHandler(domain);
-      const tools = handler.getTools();
+      // Handle navigation / discovery helper
+      if (name === "sherweb_navigate") {
+        const { domain } = args as { domain: DomainName };
 
-      const toolSummary = tools
-        .map((t) => `- ${t.name}: ${t.description}`)
-        .join("\n");
+        if (!isDomainName(domain)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Invalid domain: ${domain}. Available domains: ${getAvailableDomains().join(", ")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
 
+        const handler = await getDomainHandler(domain);
+        const tools = handler.getTools();
+
+        const toolSummary = tools
+          .map((t) => `- ${t.name}: ${t.description}`)
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${domainDescriptions[domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
+            },
+          ],
+        };
+      }
+
+
+      if (name === "sherweb_status") {
+        const creds = getCredentials();
+        const credStatus = creds
+          ? "Configured"
+          : "NOT CONFIGURED - Please set SHERWEB_CLIENT_ID, SHERWEB_CLIENT_SECRET, and SHERWEB_SUBSCRIPTION_KEY environment variables";
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Sherweb MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nAll tools are available at all times. Use sherweb_navigate to discover tools by domain.`,
+            },
+          ],
+        };
+      }
+
+      // Route to appropriate domain handler
+      const toolArgs = (args ?? {}) as Record<string, unknown>;
+
+      if (name.startsWith("sherweb_billing_")) {
+        const handler = await getDomainHandler("billing");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("sherweb_customers_")) {
+        const handler = await getDomainHandler("customers");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("sherweb_subscriptions_")) {
+        const handler = await getDomainHandler("subscriptions");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("sherweb_catalog_")) {
+        const handler = await getDomainHandler("catalog");
+        return await handler.handleCall(name, toolArgs);
+      }
+
+      // Unknown tool
       return {
         content: [
           {
             type: "text",
-            text: `${domainDescriptions[domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
+            text: `Unknown tool: ${name}. Use sherweb_navigate to discover available tools by domain.`,
           },
         ],
+        isError: true,
       };
-    }
-
-
-    if (name === "sherweb_status") {
-      const creds = getCredentials();
-      const credStatus = creds
-        ? "Configured"
-        : "NOT CONFIGURED - Please set SHERWEB_CLIENT_ID, SHERWEB_CLIENT_SECRET, and SHERWEB_SUBSCRIPTION_KEY environment variables";
-
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : undefined;
+      logger.error("Tool call failed", { tool: name, error: message, stack });
       return {
-        content: [
-          {
-            type: "text",
-            text: `Sherweb MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nAll tools are available at all times. Use sherweb_navigate to discover tools by domain.`,
-          },
-        ],
+        content: [{ type: "text", text: `Error: ${message}` }],
+        isError: true,
       };
     }
-
-    // Route to appropriate domain handler
-    const toolArgs = (args ?? {}) as Record<string, unknown>;
-
-    if (name.startsWith("sherweb_billing_")) {
-      const handler = await getDomainHandler("billing");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("sherweb_customers_")) {
-      const handler = await getDomainHandler("customers");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("sherweb_subscriptions_")) {
-      const handler = await getDomainHandler("subscriptions");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("sherweb_catalog_")) {
-      const handler = await getDomainHandler("catalog");
-      return await handler.handleCall(name, toolArgs);
-    }
-
-    // Unknown tool
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Unknown tool: ${name}. Use sherweb_navigate to discover available tools by domain.`,
-        },
-      ],
-      isError: true,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const stack = error instanceof Error ? error.stack : undefined;
-    logger.error("Tool call failed", { tool: name, error: message, stack });
-    return {
-      content: [{ type: "text", text: `Error: ${message}` }],
-      isError: true,
-    };
-  }
-});
+  });
+}
 
 /**
  * Start the server with stdio transport (default)
  */
 async function startStdioTransport(): Promise<void> {
+  const server = createFreshServer();
+  setServerRef(server);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const mode = isLazyLoadingEnabled() ? "lazy loading" : "decision tree";
   logger.info(`Sherweb MCP server running on stdio (${mode} mode)`);
+}
+
+/**
+ * Handle a single POST /mcp request with a fresh, stateless Server + transport.
+ *
+ * The body is fully guarded: on any failure we respond 500 (when the response
+ * has not started) and never rethrow. A global unhandledRejection handler
+ * could otherwise terminate the whole container over one bad request.
+ */
+async function handleMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const server = createFreshServer();
+  setServerRef(server);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+
+  // Dispose the per-request server + transport once the response closes.
+  res.on("close", () => {
+    void transport.close();
+    void server.close();
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res);
+  } catch (error) {
+    logger.error("MCP request handling failed", {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal error" },
+          id: null,
+        })
+      );
+    }
+  }
 }
 
 /**
@@ -513,11 +584,6 @@ async function startHttpTransport(): Promise<void> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
-
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    enableJsonResponse: true,
-  });
 
   const httpServer = createHttpServer(
     (req: IncomingMessage, res: ServerResponse) => {
@@ -567,16 +633,20 @@ async function startHttpTransport(): Promise<void> {
             return;
           }
 
-          // Pass credentials via AsyncLocalStorage so concurrent requests
-          // cannot leak credentials across tenants.
+          // Build the fresh per-request server + transport INSIDE the
+          // gateway branch, after the credential check, and run it within the
+          // AsyncLocalStorage context so per-request credentials stay bound to
+          // handleRequest and cannot leak across tenants.
           runWithCredentials(
             { clientId, clientSecret, subscriptionKey },
-            () => transport.handleRequest(req, res),
+            () => {
+              void handleMcpRequest(req, res);
+            },
           );
           return;
         }
 
-        transport.handleRequest(req, res);
+        void handleMcpRequest(req, res);
         return;
       }
 
@@ -590,8 +660,6 @@ async function startHttpTransport(): Promise<void> {
       );
     }
   );
-
-  await server.connect(transport);
 
   await new Promise<void>((resolve) => {
     httpServer.listen(port, host, () => {
@@ -614,7 +682,6 @@ async function startHttpTransport(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       httpServer.close((err) => (err ? reject(err) : resolve()));
     });
-    await server.close();
     process.exit(0);
   };
 
