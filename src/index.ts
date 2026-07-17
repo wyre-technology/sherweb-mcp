@@ -49,6 +49,7 @@ import {
   routeIntent,
 } from "./utils/categories.js";
 import { HEALTH_RESPONSE, isHealthPath } from "./health.js";
+import { registerResourceHandlers } from "./resources.js";
 
 /**
  * Domain metadata for navigation
@@ -82,6 +83,7 @@ function createFreshServer(): Server {
     {
       capabilities: {
         tools: {},
+        resources: {},
       },
     }
   );
@@ -91,6 +93,7 @@ function createFreshServer(): Server {
   };
 
   setupHandlers(server);
+  registerResourceHandlers(server);
   return server;
 }
 

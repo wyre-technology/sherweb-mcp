@@ -10,6 +10,10 @@ import type { DomainHandler, CallToolResult } from "../utils/types.js";
 import { serviceProviderRequest } from "../utils/client.js";
 import { elicitText, elicitConfirmation } from "../utils/elicitation.js";
 import { logger } from "../utils/logger.js";
+import {
+  buildSubscriptionCard,
+  SUBSCRIPTION_CARD_META,
+} from "../card.builder.js";
 
 /**
  * Subscription domain tool definitions
@@ -43,6 +47,7 @@ function getTools(): Tool[] {
       name: "sherweb_subscriptions_get",
       description:
         "Get detailed information about a specific subscription including product details, pricing, quantity, and renewal dates.",
+      _meta: SUBSCRIPTION_CARD_META,
       inputSchema: {
         type: "object",
         properties: {
@@ -129,9 +134,28 @@ async function handleCall(
         `/customers/${customerId}/subscriptions/${subscriptionId}`
       );
 
+      // MCP Apps: attach the normalized card payload the ui:// subscription
+      // card renders from. Best-effort — any failure just means no card, the
+      // model-visible JSON is otherwise unchanged.
+      let payload: unknown = response;
+      if (response && typeof response === "object" && !Array.isArray(response)) {
+        try {
+          const card = await buildSubscriptionCard(
+            response as Record<string, unknown>,
+            customerId,
+            () => serviceProviderRequest(`/customers/${customerId}`)
+          );
+          if (card) {
+            payload = { ...(response as Record<string, unknown>), _card: card };
+          }
+        } catch {
+          // Card building never affects the tool result.
+        }
+      }
+
       return {
         content: [
-          { type: "text", text: JSON.stringify(response, null, 2) },
+          { type: "text", text: JSON.stringify(payload, null, 2) },
         ],
       };
     }

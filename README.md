@@ -83,6 +83,16 @@ Customer account management
 ### Subscriptions
 Subscription lifecycle management
 
+## Interactive Subscription Card (MCP Apps)
+
+`sherweb_subscriptions_get` renders as an interactive, read-only card in MCP
+Apps hosts (Claude Desktop/web) showing the product, customer, status,
+quantity, billing cycle, commitment/renewal dates, and fees; plain-JSON
+behavior is unchanged in other hosts. The card is neutral by default and
+brandable via `window.__BRAND__` injection or `MCP_BRAND_*` env vars
+(`MCP_BRAND_NAME`, `MCP_BRAND_LOGO_URL`, `MCP_BRAND_PRIMARY_COLOR`,
+`MCP_BRAND_ACCENT_COLOR`, `MCP_BRAND_BG`, `MCP_BRAND_TEXT`) — no rebuild
+needed.
 
 ## Development
 
