@@ -26,16 +26,43 @@ import {
 } from "./types.js";
 
 /**
- * OAuth2 token cache
+ * OAuth2 token cache entry.
  */
-let accessToken: string | null = null;
-let tokenExpiry: number = 0;
+interface CachedToken {
+  accessToken: string;
+  tokenExpiry: number;
+}
+
+/**
+ * OAuth2 token cache, keyed per tenant.
+ *
+ * Credentials already flow per-request via AsyncLocalStorage (see
+ * `credentialStore` below), but the OAuth *token* derived from those
+ * credentials used to be cached in module-level `let` variables shared by
+ * every request. Because Sherweb tokens are valid for ~59 minutes, that
+ * meant any tenant whose request landed within another tenant's token
+ * lifetime would deterministically receive the prior tenant's bearer token
+ * — not a rare race, a guaranteed cross-tenant credential reuse under
+ * normal multi-tenant traffic. The cache below is keyed by tenant identity
+ * (clientId + subscriptionKey, the same fields that already distinguish
+ * tenants when resolving raw credentials) so each tenant only ever reads
+ * back its own token, while still allowing legitimate reuse of a
+ * still-valid token across concurrent requests for the *same* tenant.
+ */
+const tokenCache = new Map<string, CachedToken>();
 
 /**
  * Per-request credential store for gateway mode.
  * Ensures concurrent requests cannot leak credentials across tenants.
  */
 const credentialStore = new AsyncLocalStorage<SherwebCredentials>();
+
+/**
+ * Derive the tenant cache key from a credential set.
+ */
+function tenantKey(creds: SherwebCredentials): string {
+  return `${creds.clientId}::${creds.subscriptionKey}`;
+}
 
 /**
  * Run a callback with per-request credential overrides.
@@ -77,9 +104,12 @@ export function getCredentials(): SherwebCredentials | null {
  * Caches the token until expiry.
  */
 async function authenticate(creds: SherwebCredentials): Promise<string> {
-  // Return cached token if still valid
-  if (accessToken && Date.now() < tokenExpiry) {
-    return accessToken;
+  const key = tenantKey(creds);
+
+  // Return cached token if still valid — scoped to this tenant only.
+  const cached = tokenCache.get(key);
+  if (cached && Date.now() < cached.tokenExpiry) {
+    return cached.accessToken;
   }
 
   logger.debug("Authenticating with Sherweb OAuth2 endpoint");
@@ -113,15 +143,17 @@ async function authenticate(creds: SherwebCredentials): Promise<string> {
     token_type: string;
   };
 
-  accessToken = data.access_token;
   // Expire 60 seconds early to avoid edge cases
-  tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  tokenCache.set(key, {
+    accessToken: data.access_token,
+    tokenExpiry: Date.now() + (data.expires_in - 60) * 1000,
+  });
 
   logger.info("Sherweb authentication successful", {
     expiresIn: data.expires_in,
   });
 
-  return accessToken;
+  return data.access_token;
 }
 
 /**
@@ -181,7 +213,7 @@ export async function distributorRequest<T>(
   }
 
   if (!response.ok) {
-    handleApiError(response.status, responseBody, url.toString());
+    handleApiError(response.status, responseBody, url.toString(), creds);
   }
 
   return responseBody as T;
@@ -244,7 +276,7 @@ export async function serviceProviderRequest<T>(
   }
 
   if (!response.ok) {
-    handleApiError(response.status, responseBody, url.toString());
+    handleApiError(response.status, responseBody, url.toString(), creds);
   }
 
   return responseBody as T;
@@ -253,7 +285,12 @@ export async function serviceProviderRequest<T>(
 /**
  * Handle API error responses with clear error messages
  */
-function handleApiError(status: number, responseBody: unknown, url: string): never {
+function handleApiError(
+  status: number,
+  responseBody: unknown,
+  url: string,
+  creds: SherwebCredentials
+): never {
   const message =
     typeof responseBody === "object" &&
     responseBody !== null &&
@@ -264,9 +301,9 @@ function handleApiError(status: number, responseBody: unknown, url: string): nev
   logger.error("Sherweb API error", { status, url, message });
 
   if (status === 401) {
-    // Reset token cache on auth failure
-    accessToken = null;
-    tokenExpiry = 0;
+    // Evict only this tenant's cached token on auth failure — never touch
+    // other tenants' entries in the shared tokenCache.
+    tokenCache.delete(tenantKey(creds));
     throw new Error(
       `Authentication failed: ${message}. Check your SHERWEB_CLIENT_ID, SHERWEB_CLIENT_SECRET, and SHERWEB_SUBSCRIPTION_KEY.`
     );
@@ -283,13 +320,4 @@ function handleApiError(status: number, responseBody: unknown, url: string): nev
     throw new Error(`Rate limit exceeded: ${message}. Please wait and retry.`);
   }
   throw new Error(`Sherweb API error (${status}): ${message}`);
-}
-
-/**
- * Reset the token cache.
- * Used in gateway mode to pick up new credentials from headers.
- */
-export function resetClient(): void {
-  accessToken = null;
-  tokenExpiry = 0;
 }
