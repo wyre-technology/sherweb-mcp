@@ -10,26 +10,24 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { DomainHandler, CallToolResult } from "../utils/types.js";
+import {
+  type DomainHandler,
+  type CallToolResult,
+  errorResult,
+  jsonResult,
+  matches,
+} from "../utils/types.js";
 import { serviceProviderRequest } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
 
-/** Localized text as returned by the catalog endpoint. */
-interface Translation {
-  culture?: string;
-  value?: string;
+/** The parts of the CustomerCatalog response this handler reads. */
+interface CatalogItem {
+  sku?: string;
+  name?: Array<{ value?: string }>;
 }
 
-/** Shape of the documented CustomerCatalog response. */
 interface CustomerCatalog {
-  customerId?: string;
-  catalogItems?: Array<{
-    sku?: string;
-    name?: Translation[];
-    description?: Translation[];
-    billingCycle?: string;
-    commitmentTerm?: string;
-  }>;
+  catalogItems?: CatalogItem[];
 }
 
 /**
@@ -62,13 +60,10 @@ function getTools(): Tool[] {
 }
 
 /** Does a catalog item match the search needle, in any culture? */
-function itemMatches(
-  item: NonNullable<CustomerCatalog["catalogItems"]>[number],
-  needle: string
-): boolean {
-  if (String(item.sku ?? "").toLowerCase().includes(needle)) return true;
-  return (item.name ?? []).some((n) =>
-    String(n.value ?? "").toLowerCase().includes(needle)
+function itemMatches(item: CatalogItem, needle: string): boolean {
+  return (
+    matches(item.sku, needle) ||
+    (item.name ?? []).some((n) => matches(n.value, needle))
   );
 }
 
@@ -86,38 +81,25 @@ async function handleCall(
         search?: string;
       };
 
-      logger.info("API call: catalog.getCustomerCatalog", { customerId });
+      logger.info("API call: catalog.getCustomerCatalog", {
+        customerId,
+        search,
+      });
 
       const response = await serviceProviderRequest<CustomerCatalog>(
         `/customer-catalogs/${customerId}`
       );
 
-      if (!search) {
-        return {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-        };
-      }
-
-      const needle = search.toLowerCase();
+      const needle = (search ?? "").toLowerCase();
       const catalogItems = (response.catalogItems ?? []).filter((item) =>
         itemMatches(item, needle)
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ ...response, catalogItems }, null, 2),
-          },
-        ],
-      };
+      return jsonResult({ ...response, catalogItems });
     }
 
     default:
-      return {
-        content: [{ type: "text", text: `Unknown catalog tool: ${toolName}` }],
-        isError: true,
-      };
+      return errorResult(`Unknown catalog tool: ${toolName}`);
   }
 }
 

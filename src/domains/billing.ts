@@ -11,7 +11,14 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { DomainHandler, CallToolResult } from "../utils/types.js";
+import {
+  type DomainHandler,
+  type CallToolResult,
+  DATE_PARAM_DESCRIPTION,
+  errorResult,
+  findByKey,
+  jsonResult,
+} from "../utils/types.js";
 import { distributorRequest } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
 
@@ -21,9 +28,6 @@ interface PayableCharges {
   periodTo?: string;
   charges?: Array<Record<string, unknown>>;
 }
-
-const DATE_DESCRIPTION =
-  "Any date inside the desired billing period, format yyyy-MM-dd (UTC). Defaults to today. E.g. 2026-03-17 returns the period containing March 17.";
 
 /**
  * Billing domain tool definitions
@@ -39,7 +43,7 @@ function getTools(): Tool[] {
         properties: {
           date: {
             type: "string",
-            description: DATE_DESCRIPTION,
+            description: DATE_PARAM_DESCRIPTION,
           },
         },
       },
@@ -57,7 +61,7 @@ function getTools(): Tool[] {
           },
           date: {
             type: "string",
-            description: `${DATE_DESCRIPTION} Use this when the charge falls outside the current period.`,
+            description: `${DATE_PARAM_DESCRIPTION} Use this when the charge falls outside the current period.`,
           },
         },
         required: ["chargeId"],
@@ -66,17 +70,10 @@ function getTools(): Tool[] {
   ];
 }
 
-/**
- * Fetch one billing period's payable charges.
- */
-async function fetchPayableCharges(date?: string): Promise<PayableCharges> {
-  const params: Record<string, string | undefined> = {};
-  if (date) params.date = date;
-
-  logger.info("API call: billing.payableCharges", { params });
-
+/** Fetch one billing period's payable charges. */
+function fetchPayableCharges(date?: string): Promise<PayableCharges> {
   return distributorRequest<PayableCharges>("/billing/payable-charges", {
-    params,
+    params: { date },
   });
 }
 
@@ -90,41 +87,31 @@ async function handleCall(
   switch (toolName) {
     case "sherweb_billing_payable_charges": {
       const { date } = args as { date?: string };
-      const response = await fetchPayableCharges(date);
 
-      return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-      };
+      logger.info("API call: billing.payableCharges", { date });
+
+      return jsonResult(await fetchPayableCharges(date));
     }
 
     case "sherweb_billing_charge_details": {
       const { chargeId, date } = args as { chargeId: string; date?: string };
 
+      logger.info("API call: billing.chargeDetails", { chargeId, date });
+
       const response = await fetchPayableCharges(date);
-      const charge = response.charges?.find((c) => c.chargeId === chargeId);
+      const charge = findByKey(response.charges, "chargeId", chargeId);
 
       if (!charge) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Charge '${chargeId}' was not found in the billing period ${response.periodFrom ?? "?"} to ${response.periodTo ?? "?"}. Charges are only retrievable per billing period — pass a 'date' inside the period the charge belongs to.`,
-            },
-          ],
-          isError: true,
-        };
+        return errorResult(
+          `Charge '${chargeId}' was not found in the billing period ${response.periodFrom ?? "?"} to ${response.periodTo ?? "?"}. Charges are only retrievable per billing period — pass a 'date' inside the period the charge belongs to.`
+        );
       }
 
-      return {
-        content: [{ type: "text", text: JSON.stringify(charge, null, 2) }],
-      };
+      return jsonResult(charge);
     }
 
     default:
-      return {
-        content: [{ type: "text", text: `Unknown billing tool: ${toolName}` }],
-        isError: true,
-      };
+      return errorResult(`Unknown billing tool: ${toolName}`);
   }
 }
 

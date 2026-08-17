@@ -19,7 +19,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runWithCredentials } from "../utils/client.js";
-import { getDomainHandler } from "./index.js";
+import { getAvailableDomains, getDomainHandler } from "./index.js";
+import { findDomainForTool, listCategories } from "../utils/categories.js";
 import { SHERWEB_AUTH_URL, type SherwebCredentials } from "../utils/types.js";
 
 const CREDS: SherwebCredentials = {
@@ -35,12 +36,11 @@ const DIST = "https://api.sherweb.com/distributor/v1";
 let apiCalls: Array<{ url: string; method: string; body: unknown }>;
 
 function jsonResponse(payload: unknown): Response {
-  const text = JSON.stringify(payload);
   return {
     ok: true,
     status: 200,
-    text: async () => text,
-    json: async () => JSON.parse(text),
+    text: async () => JSON.stringify(payload),
+    json: async () => payload,
   } as Response;
 }
 
@@ -244,13 +244,17 @@ describe("subscription tools call documented Service Provider endpoints", () => 
     });
 
     // There is no single-subscription endpoint, so the tool fetches the
-    // customer's details collection and filters client-side. The second call
-    // is the MCP Apps card resolving the customer's display name — it must go
-    // to the customers collection, since GET /customers/{id} does not exist.
-    expect(apiCalls.map((c) => c.url)).toEqual([
-      `${SP}/billing/subscriptions/details?customerId=cust-1`,
-      `${SP}/customers`,
-    ]);
+    // customer's details collection and filters client-side. The other call is
+    // the MCP Apps card resolving the customer's display name — it must go to
+    // the customers collection, since GET /customers/{id} does not exist. The
+    // two run concurrently, so compare as a set: their order is scheduling
+    // detail, not contract.
+    expect(new Set(apiCalls.map((c) => c.url))).toEqual(
+      new Set([
+        `${SP}/billing/subscriptions/details?customerId=cust-1`,
+        `${SP}/customers`,
+      ]),
+    );
     expect(result.content[0].text).toContain("Wanted Product");
     expect(result.content[0].text).not.toContain("Other Product");
   });
@@ -267,17 +271,17 @@ describe("subscription tools call documented Service Provider endpoints", () => 
     expect(result.content[0].text).toContain("absent");
   });
 
-  it("change_quantity POSTs an amendment in the documented body shape", async () => {
+  it("change_quantity POSTs an amendment and returns the async receipt", async () => {
     stubFetch({
       subscriptionsAmendmentId: "amend-1",
       trackingId: { requestTrackingId: "track-1" },
     });
 
-    await callTool("subscriptions", "sherweb_subscriptions_change_quantity", {
-      customerId: "cust-1",
-      subscriptionId: "sub-1",
-      quantity: 12,
-    });
+    const result = await callTool(
+      "subscriptions",
+      "sherweb_subscriptions_change_quantity",
+      { customerId: "cust-1", subscriptionId: "sub-1", quantity: 12 },
+    );
 
     const call = soleCall();
     expect(call.url).toBe(
@@ -291,24 +295,7 @@ describe("subscription tools call documented Service Provider endpoints", () => 
         { subscriptionId: "sub-1", newQuantity: 12 },
       ],
     });
-  });
-
-  it("change_quantity surfaces the tracking id so the caller can poll", async () => {
-    stubFetch({
-      subscriptionsAmendmentId: "amend-1",
-      trackingId: { requestTrackingId: "track-1" },
-    });
-
-    const result = await callTool(
-      "subscriptions",
-      "sherweb_subscriptions_change_quantity",
-      { customerId: "cust-1", subscriptionId: "sub-1", quantity: 12 },
-    );
-
     // Amendments are asynchronous: the response is a receipt, not a result.
-    expect(soleCall().url).toBe(
-      `${SP}/billing/subscriptions/amendments?customerId=cust-1`,
-    );
     expect(result.content[0].text).toContain("track-1");
     expect(result.content[0].text).toContain("amend-1");
   });
@@ -322,6 +309,36 @@ describe("subscription tools call documented Service Provider endpoints", () => 
 
     // TrackRequest, not the deprecated amendments/{id}/status endpoint.
     expect(soleCall().url).toBe(`${SP}/tracking/track-1`);
+  });
+});
+
+describe("lazy-loading category registry stays in step with the handlers", () => {
+  // In lazy mode a tool missing from the category registry fails in one
+  // direction only: sherweb_list_category_tools advertises it (it reads
+  // getTools()) while sherweb_execute_tool rejects it as unknown (it resolves
+  // the domain through the registry). Advertised-but-unrunnable is the same
+  // failure shape as calling an endpoint that does not exist, so pin it.
+  it("resolves a domain for every tool the handlers expose", async () => {
+    for (const domain of getAvailableDomains()) {
+      const handler = await getDomainHandler(domain);
+      for (const tool of handler.getTools()) {
+        expect(await findDomainForTool(tool.name)).toBe(domain);
+      }
+    }
+  });
+
+  it("resolves no domain for an unknown tool", async () => {
+    expect(await findDomainForTool("sherweb_not_a_real_tool")).toBeNull();
+  });
+
+  it("reports a tool count per category matching the handler", async () => {
+    const categories = await listCategories();
+    expect(categories.map((c) => c.name)).toEqual(getAvailableDomains());
+
+    for (const category of categories) {
+      const handler = await getDomainHandler(category.name);
+      expect(category.toolCount).toBe(handler.getTools().length);
+    }
   });
 });
 

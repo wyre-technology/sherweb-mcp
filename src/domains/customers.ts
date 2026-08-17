@@ -11,13 +11,36 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { DomainHandler, CallToolResult } from "../utils/types.js";
+import {
+  type DomainHandler,
+  type CallToolResult,
+  type ItemCollection,
+  DATE_PARAM_DESCRIPTION,
+  errorResult,
+  findByKey,
+  jsonResult,
+  matches,
+} from "../utils/types.js";
 import { serviceProviderRequest } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
 
-/** Shape of the documented Customers response. */
-interface Customers {
-  items?: Array<Record<string, unknown>>;
+/**
+ * Fetch the full customer collection. Sherweb has no single-customer
+ * endpoint, so this is the only way in — every customer lookup in the server
+ * goes through here so the workaround has exactly one owner.
+ */
+export async function fetchCustomers(): Promise<ItemCollection> {
+  return serviceProviderRequest<ItemCollection>("/customers");
+}
+
+/**
+ * Resolve one customer by ID, or undefined when no such customer exists.
+ */
+export async function findCustomer(
+  customerId: string
+): Promise<Record<string, unknown> | undefined> {
+  const customers = await fetchCustomers();
+  return findByKey(customers.items, "id", customerId);
 }
 
 /**
@@ -68,22 +91,13 @@ function getTools(): Tool[] {
           },
           date: {
             type: "string",
-            description:
-              "Any date inside the desired billing period, format yyyy-MM-dd (UTC). Defaults to today.",
+            description: DATE_PARAM_DESCRIPTION,
           },
         },
         required: ["customerId"],
       },
     },
   ];
-}
-
-/**
- * Fetch the full customer collection.
- */
-async function fetchCustomers(): Promise<Customers> {
-  logger.info("API call: customers.list");
-  return serviceProviderRequest<Customers>("/customers");
 }
 
 /**
@@ -97,22 +111,15 @@ async function handleCall(
     case "sherweb_customers_list": {
       const { search } = args as { search?: string };
 
+      logger.info("API call: customers.list", { search });
+
       const response = await fetchCustomers();
-
-      if (!search) {
-        return {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-        };
-      }
-
-      const needle = search.toLowerCase();
+      const needle = (search ?? "").toLowerCase();
       const items = (response.items ?? []).filter((c) =>
-        String(c.displayName ?? "").toLowerCase().includes(needle)
+        matches(c.displayName, needle)
       );
 
-      return {
-        content: [{ type: "text", text: JSON.stringify({ items }, null, 2) }],
-      };
+      return jsonResult({ ...response, items });
     }
 
     case "sherweb_customers_get": {
@@ -120,24 +127,14 @@ async function handleCall(
 
       logger.info("API call: customers.get", { customerId });
 
-      const response = await fetchCustomers();
-      const customer = (response.items ?? []).find((c) => c.id === customerId);
-
+      const customer = await findCustomer(customerId);
       if (!customer) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Customer '${customerId}' was not found under this service provider account. Use sherweb_customers_list to see available customers.`,
-            },
-          ],
-          isError: true,
-        };
+        return errorResult(
+          `Customer '${customerId}' was not found under this service provider account. Use sherweb_customers_list to see available customers.`
+        );
       }
 
-      return {
-        content: [{ type: "text", text: JSON.stringify(customer, null, 2) }],
-      };
+      return jsonResult(customer);
     }
 
     case "sherweb_customers_accounts_receivable": {
@@ -146,28 +143,20 @@ async function handleCall(
         date?: string;
       };
 
-      const params: Record<string, string | undefined> = { customerId };
-      if (date) params.date = date;
+      logger.info("API call: customers.receivableCharges", {
+        customerId,
+        date,
+      });
 
-      logger.info("API call: customers.receivableCharges", { params });
-
-      const response = await serviceProviderRequest(
-        "/billing/receivable-charges",
-        { params }
+      return jsonResult(
+        await serviceProviderRequest("/billing/receivable-charges", {
+          params: { customerId, date },
+        })
       );
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-      };
     }
 
     default:
-      return {
-        content: [
-          { type: "text", text: `Unknown customers tool: ${toolName}` },
-        ],
-        isError: true,
-      };
+      return errorResult(`Unknown customers tool: ${toolName}`);
   }
 }
 

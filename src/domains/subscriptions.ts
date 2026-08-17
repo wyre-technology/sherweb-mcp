@@ -14,19 +14,22 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { DomainHandler, CallToolResult } from "../utils/types.js";
+import {
+  type DomainHandler,
+  type CallToolResult,
+  type ItemCollection,
+  errorResult,
+  findByKey,
+  jsonResult,
+} from "../utils/types.js";
 import { serviceProviderRequest } from "../utils/client.js";
 import { elicitConfirmation } from "../utils/elicitation.js";
 import { logger } from "../utils/logger.js";
+import { findCustomer } from "./customers.js";
 import {
   buildSubscriptionCard,
   SUBSCRIPTION_CARD_META,
 } from "../card.builder.js";
-
-/** Shape of the documented Subscriptions / CustomerSubscriptions responses. */
-interface SubscriptionCollection {
-  items?: Array<Record<string, unknown>>;
-}
 
 /** Documented response of a successful amendment submission. */
 interface AmendmentReceipt {
@@ -117,29 +120,6 @@ function getTools(): Tool[] {
 }
 
 /**
- * Fetch a customer's subscription details collection.
- */
-async function fetchSubscriptionDetails(
-  customerId: string
-): Promise<SubscriptionCollection> {
-  return serviceProviderRequest<SubscriptionCollection>(
-    "/billing/subscriptions/details",
-    { params: { customerId } }
-  );
-}
-
-/**
- * Resolve a customer's display name for the subscription card. Sherweb has no
- * single-customer endpoint, so this reads the collection and selects the match.
- */
-async function lookupCustomer(customerId: string): Promise<unknown> {
-  const customers = await serviceProviderRequest<{
-    items?: Array<Record<string, unknown>>;
-  }>("/customers");
-  return (customers.items ?? []).find((c) => c.id === customerId);
-}
-
-/**
  * Handle subscription domain tool calls
  */
 async function handleCall(
@@ -152,13 +132,11 @@ async function handleCall(
 
       logger.info("API call: subscriptions.list", { customerId });
 
-      const response = await serviceProviderRequest("/billing/subscriptions", {
-        params: { customerId },
-      });
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-      };
+      return jsonResult(
+        await serviceProviderRequest("/billing/subscriptions", {
+          params: { customerId },
+        })
+      );
     }
 
     case "sherweb_subscriptions_get": {
@@ -169,21 +147,22 @@ async function handleCall(
 
       logger.info("API call: subscriptions.get", { customerId, subscriptionId });
 
-      const response = await fetchSubscriptionDetails(customerId);
-      const subscription = (response.items ?? []).find(
-        (s) => s.id === subscriptionId
+      // The subscription-details payload carries no customer name, so the
+      // MCP Apps card needs a second, independent request. Start it now so it
+      // overlaps the details fetch instead of running after it. The catch
+      // keeps the not-found path below from surfacing an unhandled rejection.
+      const customerPromise = findCustomer(customerId).catch(() => undefined);
+
+      const response = await serviceProviderRequest<ItemCollection>(
+        "/billing/subscriptions/details",
+        { params: { customerId } }
       );
+      const subscription = findByKey(response.items, "id", subscriptionId);
 
       if (!subscription) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Subscription '${subscriptionId}' was not found for customer '${customerId}'. Use sherweb_subscriptions_list to see that customer's subscriptions.`,
-            },
-          ],
-          isError: true,
-        };
+        return errorResult(
+          `Subscription '${subscriptionId}' was not found for customer '${customerId}'. Use sherweb_subscriptions_list to see that customer's subscriptions.`
+        );
       }
 
       // MCP Apps: attach the normalized card payload the ui:// subscription
@@ -191,8 +170,10 @@ async function handleCall(
       // model-visible JSON is otherwise unchanged.
       let payload: unknown = subscription;
       try {
-        const card = await buildSubscriptionCard(subscription, customerId, () =>
-          lookupCustomer(customerId)
+        const card = await buildSubscriptionCard(
+          subscription,
+          customerId,
+          () => customerPromise
         );
         if (card) {
           payload = { ...subscription, _card: card };
@@ -201,9 +182,7 @@ async function handleCall(
         // Card building never affects the tool result.
       }
 
-      return {
-        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-      };
+      return jsonResult(payload);
     }
 
     case "sherweb_subscriptions_change_quantity": {
@@ -219,9 +198,7 @@ async function handleCall(
       );
 
       if (confirmed === false) {
-        return {
-          content: [{ type: "text", text: "Quantity change cancelled by user." }],
-        };
+        return jsonResult({ cancelled: true, reason: "Cancelled by user." });
       }
 
       logger.info("API call: subscriptions.createAmendment", {
@@ -245,25 +222,15 @@ async function handleCall(
 
       const trackingId = response.trackingId?.requestTrackingId;
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                submitted: true,
-                subscriptionsAmendmentId: response.subscriptionsAmendmentId,
-                trackingId,
-                note: trackingId
-                  ? `The amendment was accepted but is processed asynchronously — it is not applied yet. Poll sherweb_subscriptions_amendment_status with trackingId '${trackingId}' to confirm the outcome.`
-                  : "The amendment was accepted but is processed asynchronously and Sherweb returned no tracking ID.",
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return jsonResult({
+        subscriptionsAmendmentId: response.subscriptionsAmendmentId,
+        trackingId,
+        note:
+          "The amendment was accepted but is processed asynchronously — it is not applied yet." +
+          (trackingId
+            ? ` Poll sherweb_subscriptions_amendment_status with trackingId '${trackingId}' to confirm the outcome.`
+            : " Sherweb returned no tracking ID, so the outcome cannot be polled."),
+      });
     }
 
     case "sherweb_subscriptions_amendment_status": {
@@ -271,20 +238,16 @@ async function handleCall(
 
       logger.info("API call: subscriptions.trackRequest", { trackingId });
 
-      const response = await serviceProviderRequest(`/tracking/${trackingId}`);
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-      };
+      // /tracking/{id} is Sherweb's generic request tracker, not a
+      // subscription-specific endpoint — it lives under this domain because
+      // amendments are currently the only async operation the server submits.
+      return jsonResult(
+        await serviceProviderRequest(`/tracking/${trackingId}`)
+      );
     }
 
     default:
-      return {
-        content: [
-          { type: "text", text: `Unknown subscriptions tool: ${toolName}` },
-        ],
-        isError: true,
-      };
+      return errorResult(`Unknown subscriptions tool: ${toolName}`);
   }
 }
 
