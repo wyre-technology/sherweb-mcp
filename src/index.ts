@@ -19,10 +19,10 @@
  *   - Headers: X-Sherweb-Client-ID, X-Sherweb-Client-Secret, X-Sherweb-Subscription-Key
  *
  * Domains:
- * - billing: Payable charges, billing periods, charge details, pricing
- * - customers: List customers, customer details, accounts receivable
- * - subscriptions: Subscription management, quantity changes
- * - catalog: Product catalog browsing (future capability)
+ * - billing: Distributor payable charges for a billing period, charge detail
+ * - customers: List/look up customers, and their receivable charges
+ * - subscriptions: List, detail, and asynchronous quantity amendments
+ * - catalog: Per-customer product catalog browsing
  */
 
 import {
@@ -58,10 +58,11 @@ const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
  * Domain metadata for navigation
  */
 const domainDescriptions: Record<DomainName, string> = {
-  billing: "Payable charges, billing periods, charge details, pricing",
-  customers: "List customers, customer details, accounts receivable",
-  subscriptions: "Subscription management, quantity changes",
-  catalog: "Product catalog browsing (future capability)",
+  billing: "Distributor payable charges for a billing period, and charge detail",
+  customers: "List and look up customers, and their receivable charges",
+  subscriptions:
+    "List subscriptions, get details, and submit quantity amendments",
+  catalog: "Per-customer product catalog browsing",
 };
 
 /**

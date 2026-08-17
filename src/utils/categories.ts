@@ -35,15 +35,16 @@ export const TOOL_CATEGORIES: Record<DomainName, ToolCategory> = {
     ],
   },
   subscriptions: {
-    description: "Subscription management and quantity changes",
+    description: "Subscription listing, details, and quantity amendments",
     tools: [
       "sherweb_subscriptions_list",
       "sherweb_subscriptions_get",
       "sherweb_subscriptions_change_quantity",
+      "sherweb_subscriptions_amendment_status",
     ],
   },
   catalog: {
-    description: "Product catalog browsing (future capability)",
+    description: "Per-customer product catalog browsing",
     tools: [
       "sherweb_catalog_list_products",
     ],
@@ -89,6 +90,11 @@ const INTENT_KEYWORDS: Record<string, string[]> = {
   quantity: ["sherweb_subscriptions_change_quantity"],
   license: ["sherweb_subscriptions_change_quantity"],
   seats: ["sherweb_subscriptions_change_quantity"],
+  amendment: [
+    "sherweb_subscriptions_change_quantity",
+    "sherweb_subscriptions_amendment_status",
+  ],
+  tracking: ["sherweb_subscriptions_amendment_status"],
   // Catalog
   catalog: ["sherweb_catalog_list_products"],
   product: ["sherweb_catalog_list_products"],

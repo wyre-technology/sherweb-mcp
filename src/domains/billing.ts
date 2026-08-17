@@ -1,15 +1,29 @@
 /**
  * Billing domain tools for Sherweb MCP Server
  *
- * Handles distributor payable charges, billing periods, and charge details.
+ * Handles distributor payable charges.
  * Uses the Distributor API (v1): https://api.sherweb.com/distributor/v1
+ *
+ * The Distributor API publishes exactly one operation — GetPayableCharges —
+ * whose only query parameter is `date` (any day inside the desired billing
+ * period). There is no per-charge endpoint and no pagination, so charge
+ * lookup filters the collection client-side.
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { DomainHandler, CallToolResult } from "../utils/types.js";
 import { distributorRequest } from "../utils/client.js";
-import { elicitSelection } from "../utils/elicitation.js";
 import { logger } from "../utils/logger.js";
+
+/** Shape of the documented PayableCharges response. */
+interface PayableCharges {
+  periodFrom?: string;
+  periodTo?: string;
+  charges?: Array<Record<string, unknown>>;
+}
+
+const DATE_DESCRIPTION =
+  "Any date inside the desired billing period, format yyyy-MM-dd (UTC). Defaults to today. E.g. 2026-03-17 returns the period containing March 17.";
 
 /**
  * Billing domain tool definitions
@@ -19,33 +33,13 @@ function getTools(): Tool[] {
     {
       name: "sherweb_billing_payable_charges",
       description:
-        "Get payable charges for a billing period. Returns charges including products, pricing, deductions, fees, and taxes. Filter by billing cycle type (OneTime, Monthly, Yearly) and date range.",
+        "Get the distributor payable charges for a billing period. Returns every charge in the period — recurring, usage and setup — with pricing, deductions, fees, taxes and invoice details.",
       inputSchema: {
         type: "object",
         properties: {
-          billingCycleType: {
+          date: {
             type: "string",
-            enum: ["OneTime", "Monthly", "Yearly"],
-            description:
-              "The billing cycle type to filter by (OneTime, Monthly, or Yearly)",
-          },
-          periodFrom: {
-            type: "string",
-            description:
-              "Start date of the billing period (ISO 8601 format, e.g., 2025-01-01)",
-          },
-          periodTo: {
-            type: "string",
-            description:
-              "End date of the billing period (ISO 8601 format, e.g., 2025-01-31)",
-          },
-          page: {
-            type: "number",
-            description: "Page number for pagination (default: 1)",
-          },
-          pageSize: {
-            type: "number",
-            description: "Number of items per page (default: 50)",
+            description: DATE_DESCRIPTION,
           },
         },
       },
@@ -53,19 +47,37 @@ function getTools(): Tool[] {
     {
       name: "sherweb_billing_charge_details",
       description:
-        "Get detailed breakdown of a specific charge including line items, pricing tiers, deductions, fees, and tax information.",
+        "Get the full detail of one charge by its ID. Sherweb returns charges only as a billing-period collection, so this reads the period and selects the matching charge.",
       inputSchema: {
         type: "object",
         properties: {
           chargeId: {
             type: "string",
-            description: "The unique charge ID to get details for",
+            description: "The unique charge ID to look up",
+          },
+          date: {
+            type: "string",
+            description: `${DATE_DESCRIPTION} Use this when the charge falls outside the current period.`,
           },
         },
         required: ["chargeId"],
       },
     },
   ];
+}
+
+/**
+ * Fetch one billing period's payable charges.
+ */
+async function fetchPayableCharges(date?: string): Promise<PayableCharges> {
+  const params: Record<string, string | undefined> = {};
+  if (date) params.date = date;
+
+  logger.info("API call: billing.payableCharges", { params });
+
+  return distributorRequest<PayableCharges>("/billing/payable-charges", {
+    params,
+  });
 }
 
 /**
@@ -77,63 +89,34 @@ async function handleCall(
 ): Promise<CallToolResult> {
   switch (toolName) {
     case "sherweb_billing_payable_charges": {
-      let {
-        billingCycleType,
-        periodFrom,
-        periodTo,
-        page,
-        pageSize,
-      } = args as {
-        billingCycleType?: string;
-        periodFrom?: string;
-        periodTo?: string;
-        page?: number;
-        pageSize?: number;
-      };
-
-      // Elicit billing cycle type if not provided
-      if (!billingCycleType && !periodFrom && !periodTo) {
-        const selected = await elicitSelection(
-          "What type of billing charges would you like to see?",
-          "billingCycleType",
-          [
-            { value: "Monthly", label: "Monthly recurring charges" },
-            { value: "Yearly", label: "Yearly recurring charges" },
-            { value: "OneTime", label: "One-time charges" },
-          ]
-        );
-        if (selected) billingCycleType = selected;
-      }
-
-      const params: Record<string, string | number | boolean | undefined> = {};
-      if (billingCycleType) params.billingCycleType = billingCycleType;
-      if (periodFrom) params.periodFrom = periodFrom;
-      if (periodTo) params.periodTo = periodTo;
-      if (page !== undefined) params.page = page;
-      if (pageSize !== undefined) params.pageSize = pageSize;
-
-      logger.info("API call: billing.payableCharges", { params });
-
-      const response = await distributorRequest("/payable-charges", { params });
+      const { date } = args as { date?: string };
+      const response = await fetchPayableCharges(date);
 
       return {
-        content: [
-          { type: "text", text: JSON.stringify(response, null, 2) },
-        ],
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
       };
     }
 
     case "sherweb_billing_charge_details": {
-      const { chargeId } = args as { chargeId: string };
+      const { chargeId, date } = args as { chargeId: string; date?: string };
 
-      logger.info("API call: billing.chargeDetails", { chargeId });
+      const response = await fetchPayableCharges(date);
+      const charge = response.charges?.find((c) => c.chargeId === chargeId);
 
-      const response = await distributorRequest(`/payable-charges/${chargeId}`);
+      if (!charge) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Charge '${chargeId}' was not found in the billing period ${response.periodFrom ?? "?"} to ${response.periodTo ?? "?"}. Charges are only retrievable per billing period — pass a 'date' inside the period the charge belongs to.`,
+            },
+          ],
+          isError: true,
+        };
+      }
 
       return {
-        content: [
-          { type: "text", text: JSON.stringify(response, null, 2) },
-        ],
+        content: [{ type: "text", text: JSON.stringify(charge, null, 2) }],
       };
     }
 
